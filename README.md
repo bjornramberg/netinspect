@@ -11,7 +11,7 @@ A lightweight real-time network monitoring CLI tool for Linux. Tracks processes 
 Install the required dependency:
 
 ```bash
-pip install psutil #(only use the flag if needed --break-system-packages)
+pip install psutil #(only use the flag "--break-system-packages" if needed and you know what you are doing)
 ```
 
 ## Usage
