@@ -13,10 +13,23 @@ from datetime import datetime
 
 class NetworkMonitor:
     def __init__(self):
-        self.process_data = defaultdict(lambda: {'bytes': 0, 'name': '', 'path': '', 'last_seen': time.time()})
+        self.process_data = defaultdict(lambda: {'rate': 0, 'name': '', 'path': '', 'adapter': '', 'last_seen': time.time()})
         self.last_net_io = {}
         self.update_interval = 1.0  # seconds
+        self.interface_map = {}  # Map IPs to interfaces
         
+    def update_interface_map(self):
+        """Build a map of IP addresses to network interfaces"""
+        self.interface_map = {}
+        try:
+            addrs = psutil.net_if_addrs()
+            for interface, addr_list in addrs.items():
+                for addr in addr_list:
+                    if addr.family == 2:  # AF_INET (IPv4)
+                        self.interface_map[addr.address] = interface
+        except Exception:
+            pass
+    
     def get_process_connections(self):
         """Get all processes with network connections"""
         connections = {}
@@ -36,8 +49,15 @@ class NetworkMonitor:
         """Get network IO stats per process"""
         current_time = time.time()
         
-        # Get current network IO counters
+        # Update interface map periodically
+        if not hasattr(self, '_last_interface_update') or current_time - self._last_interface_update > 5:
+            self.update_interface_map()
+            self._last_interface_update = current_time
+        
+        # Get current network IO counters and connections
         current_net_io = {}
+        process_adapters = {}
+        
         for proc in psutil.process_iter(['pid', 'name']):
             try:
                 io = proc.io_counters()
@@ -47,51 +67,77 @@ class NetworkMonitor:
                 except (psutil.AccessDenied, psutil.ZombieProcess):
                     exe_path = '[access denied]'
                 
+                # Get network connections to determine adapter
+                adapter = ''
+                try:
+                    connections = proc.net_connections()
+                    if connections:
+                        # Use the first active connection's local address to determine interface
+                        for conn in connections:
+                            if conn.laddr:
+                                local_ip = conn.laddr.ip
+                                adapter = self.interface_map.get(local_ip, '')
+                                if adapter:
+                                    break
+                        if not adapter and connections:
+                            adapter = 'unknown'
+                except (psutil.AccessDenied, psutil.ZombieProcess):
+                    adapter = '[denied]'
+                
                 current_net_io[proc.info['pid']] = {
                     'name': proc.info['name'],
                     'path': exe_path,
+                    'adapter': adapter,
                     'bytes_sent': io.write_bytes,  # Using write_bytes as proxy
                 }
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 pass
         
-        # Calculate deltas
+        # Calculate deltas and rates
         for pid, data in current_net_io.items():
             if pid in self.last_net_io:
                 bytes_delta = data['bytes_sent'] - self.last_net_io[pid]['bytes_sent']
                 if bytes_delta > 0:
-                    self.process_data[pid]['bytes'] += bytes_delta
+                    # Calculate rate in bytes per second
+                    rate = bytes_delta / self.update_interval
+                    self.process_data[pid]['rate'] = rate
                     self.process_data[pid]['name'] = data['name']
                     self.process_data[pid]['path'] = data['path']
+                    self.process_data[pid]['adapter'] = data['adapter']
+                    self.process_data[pid]['last_seen'] = current_time
+                else:
+                    # No new data, decay the rate
+                    self.process_data[pid]['rate'] = 0
                     self.process_data[pid]['last_seen'] = current_time
             else:
                 self.process_data[pid]['name'] = data['name']
                 self.process_data[pid]['path'] = data['path']
+                self.process_data[pid]['adapter'] = data['adapter']
                 self.process_data[pid]['last_seen'] = current_time
         
         self.last_net_io = current_net_io
         
-        # Clean up old processes (not seen in last 30 seconds)
+        # Clean up old processes (not seen in last 10 seconds for rate-based view)
         pids_to_remove = [pid for pid, data in self.process_data.items() 
-                         if current_time - data['last_seen'] > 30]
+                         if current_time - data['last_seen'] > 10 and data['rate'] == 0]
         for pid in pids_to_remove:
             del self.process_data[pid]
     
     def get_top_processes(self, n=10):
-        """Get top N processes by bytes sent"""
+        """Get top N processes by current transfer rate"""
         sorted_procs = sorted(
             [(pid, data) for pid, data in self.process_data.items()],
-            key=lambda x: x[1]['bytes'],
+            key=lambda x: x[1]['rate'],
             reverse=True
         )
         return sorted_procs[:n]
     
-    def get_color_for_bytes(self, bytes_sent, max_bytes):
-        """Get color pair number based on bytes sent"""
-        if max_bytes == 0:
+    def get_color_for_rate(self, rate, max_rate):
+        """Get color pair number based on transfer rate"""
+        if max_rate == 0:
             return 1
         
-        ratio = bytes_sent / max_bytes
+        ratio = rate / max_rate
         
         if ratio > 0.8:
             return 7  # Brightest
@@ -115,6 +161,14 @@ class NetworkMonitor:
                 return f"{bytes_val:.2f} {unit}"
             bytes_val /= 1024.0
         return f"{bytes_val:.2f} PB"
+    
+    def format_rate(self, bytes_per_sec):
+        """Format transfer rate to human readable format"""
+        for unit in ['B/s', 'KB/s', 'MB/s', 'GB/s']:
+            if bytes_per_sec < 1024.0:
+                return f"{bytes_per_sec:.2f} {unit}"
+            bytes_per_sec /= 1024.0
+        return f"{bytes_per_sec:.2f} TB/s"
 
 def main(stdscr):
     # Initialize colors
@@ -160,7 +214,7 @@ def main(stdscr):
         stdscr.clear()
         
         # Draw header
-        title = f"Network Process Monitor - Top {len(top_processes)} Processes by Data Sent"
+        title = f"Network Process Monitor - Top {len(top_processes)} Processes by Current Transfer Rate"
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         try:
@@ -170,12 +224,12 @@ def main(stdscr):
             stdscr.addstr(3, 0, "=" * min(width - 1, 120), curses.A_BOLD)
             
             # Column headers
-            header = f"{'Rank':<6} {'PID':<8} {'Process Name':<25} {'Path':<40} {'Data Sent':<15}"
+            header = f"{'Rank':<6} {'PID':<8} {'Process Name':<25} {'Adapter':<15} {'Path':<35} {'Current Rate':<15}"
             stdscr.addstr(5, 0, header[:width - 1], curses.A_BOLD)
             stdscr.addstr(6, 0, "-" * min(width - 1, 120))
             
-            # Get max bytes for color scaling
-            max_bytes = max([data['bytes'] for _, data in top_processes], default=1)
+            # Get max rate for color scaling
+            max_rate = max([data['rate'] for _, data in top_processes], default=1)
             
             # Display top processes
             for idx, (pid, data) in enumerate(top_processes):
@@ -184,31 +238,35 @@ def main(stdscr):
                 
                 rank = f"#{idx + 1}"
                 name = data['name'][:23]
-                path = data['path'][:38] if data['path'] else '[unknown]'
-                bytes_str = monitor.format_bytes(data['bytes'])
+                adapter = data['adapter'][:13] if data['adapter'] else '[none]'
+                path = data['path'][:33] if data['path'] else '[unknown]'
+                rate_str = monitor.format_rate(data['rate'])
                 
                 # Get color based on traffic
-                color = monitor.get_color_for_bytes(data['bytes'], max_bytes)
+                color = monitor.get_color_for_rate(data['rate'], max_rate)
                 
                 # Display line with colored process name
                 line = f"{rank:<6} {pid:<8} "
                 stdscr.addstr(7 + idx, 0, line)
                 stdscr.addstr(7 + idx, len(line), f"{name:<25}", curses.color_pair(color) | curses.A_BOLD)
                 
-                # Add path and data sent
-                path_start = len(line) + 25
-                if path_start + len(path) < width - 1:
-                    stdscr.addstr(7 + idx, path_start, f"{path:<40}")
-                    data_start = path_start + 40
-                    if data_start < width - 1:
-                        stdscr.addstr(7 + idx, data_start, f" {bytes_str}")
+                # Add adapter, path and rate
+                adapter_start = len(line) + 25
+                if adapter_start < width - 1:
+                    stdscr.addstr(7 + idx, adapter_start, f"{adapter:<15}")
+                    path_start = adapter_start + 15
+                    if path_start < width - 1:
+                        stdscr.addstr(7 + idx, path_start, f"{path:<35}")
+                        rate_start = path_start + 35
+                        if rate_start < width - 1:
+                            stdscr.addstr(7 + idx, rate_start, f" {rate_str}")
             
             # Draw footer
             if height > 20:
                 footer_line = height - 3
                 stdscr.addstr(footer_line, 0, "=" * min(width - 1, 120), curses.A_DIM)
                 stdscr.addstr(footer_line + 1, 0, 
-                            f"Color intensity indicates data volume (brighter = more data) | Showing {len(top_processes)} of {len(monitor.process_data)} active processes", 
+                            f"Color intensity indicates transfer rate (brighter = faster) | Showing {len(top_processes)} of {len(monitor.process_data)} active processes", 
                             curses.A_DIM)
             
         except curses.error:
