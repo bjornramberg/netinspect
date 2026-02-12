@@ -13,12 +13,12 @@ from collections import defaultdict
 # Import the NetworkMonitor class
 # Note: You may need to adjust the import based on your file name
 try:
-    from netmon import NetworkMonitor
+    from netinspect import NetworkMonitor
 except ImportError:
     # If running as standalone, try to import from current directory
     import os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from netmon import NetworkMonitor
+    from netinspect import NetworkMonitor
 
 
 class TestNetworkMonitor(unittest.TestCase):
