@@ -13,7 +13,7 @@ from datetime import datetime
 
 class NetworkMonitor:
     def __init__(self):
-        self.process_data = defaultdict(lambda: {'rate': 0, 'name': '', 'path': '', 'adapter': '', 'last_seen': time.time()})
+        self.process_data = defaultdict(lambda: {'rate': 0, 'total_bytes': 0, 'name': '', 'path': '', 'adapter': '', 'last_seen': time.time()})
         self.last_net_io = {}
         self.update_interval = 1.0  # seconds
         self.interface_map = {}  # Map IPs to interfaces
@@ -101,12 +101,13 @@ class NetworkMonitor:
                     # Calculate rate in bytes per second
                     rate = bytes_delta / self.update_interval
                     self.process_data[pid]['rate'] = rate
+                    self.process_data[pid]['total_bytes'] += bytes_delta
                     self.process_data[pid]['name'] = data['name']
                     self.process_data[pid]['path'] = data['path']
                     self.process_data[pid]['adapter'] = data['adapter']
                     self.process_data[pid]['last_seen'] = current_time
                 else:
-                    # No new data, decay the rate
+                    # No new data, decay the rate but keep cumulative
                     self.process_data[pid]['rate'] = 0
                     self.process_data[pid]['last_seen'] = current_time
             else:
@@ -117,9 +118,9 @@ class NetworkMonitor:
         
         self.last_net_io = current_net_io
         
-        # Clean up old processes (not seen in last 10 seconds for rate-based view)
+        # Clean up old processes (not seen in last 30 seconds and no activity)
         pids_to_remove = [pid for pid, data in self.process_data.items() 
-                         if current_time - data['last_seen'] > 10 and data['rate'] == 0]
+                         if current_time - data['last_seen'] > 30 and data['rate'] == 0]
         for pid in pids_to_remove:
             del self.process_data[pid]
     
@@ -214,19 +215,19 @@ def main(stdscr):
         stdscr.clear()
         
         # Draw header
-        title = f"Network Process Monitor - Top {len(top_processes)} Processes by Current Transfer Rate"
+        title = f"Netinspect - Top {len(top_processes)} Processes by Current Transfer Rate"
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         try:
-            stdscr.addstr(0, 0, "=" * min(width - 1, 120), curses.A_BOLD)
+            stdscr.addstr(0, 0, "=" * min(width - 1, 130), curses.A_BOLD)
             stdscr.addstr(1, 0, title[:width - 1], curses.A_BOLD | curses.A_UNDERLINE)
             stdscr.addstr(2, 0, f"Time: {timestamp}  |  Press 'q' to quit", curses.A_DIM)
-            stdscr.addstr(3, 0, "=" * min(width - 1, 120), curses.A_BOLD)
+            stdscr.addstr(3, 0, "=" * min(width - 1, 130), curses.A_BOLD)
             
             # Column headers
-            header = f"{'Rank':<6} {'PID':<8} {'Process Name':<25} {'Adapter':<15} {'Path':<35} {'Current Rate':<15}"
+            header = f"{'Rank':<6} {'PID':<8} {'Process Name':<20} {'Adapter':<12} {'Path':<28} {'Current Rate':<14} {'Total Data':<12}"
             stdscr.addstr(5, 0, header[:width - 1], curses.A_BOLD)
-            stdscr.addstr(6, 0, "-" * min(width - 1, 120))
+            stdscr.addstr(6, 0, "-" * min(width - 1, 130))
             
             # Get max rate for color scaling
             max_rate = max([data['rate'] for _, data in top_processes], default=1)
@@ -237,34 +238,34 @@ def main(stdscr):
                     break
                 
                 rank = f"#{idx + 1}"
-                name = data['name'][:23]
-                adapter = data['adapter'][:13] if data['adapter'] else '[none]'
-                path = data['path'][:33] if data['path'] else '[unknown]'
-                rate_str = monitor.format_rate(data['rate'])
+                name = data['name'][:20]
+                adapter = data['adapter'][:12] if data['adapter'] else '[none]'
+                path = data['path'][:28] if data['path'] else '[unknown]'
+                rate_str = monitor.format_rate(data['rate'])[:14]
+                total_str = monitor.format_bytes(data['total_bytes'])[:12]
                 
                 # Get color based on traffic
                 color = monitor.get_color_for_rate(data['rate'], max_rate)
                 
-                # Display line with colored process name
-                line = f"{rank:<6} {pid:<8} "
-                stdscr.addstr(7 + idx, 0, line)
-                stdscr.addstr(7 + idx, len(line), f"{name:<25}", curses.color_pair(color) | curses.A_BOLD)
+                # Build complete row as single formatted string
+                full_line = f"{rank:<6} {pid:<8} {name:<20} {adapter:<12} {path:<28} {rate_str:<14} {total_str:<12}"
                 
-                # Add adapter, path and rate
-                adapter_start = len(line) + 25
-                if adapter_start < width - 1:
-                    stdscr.addstr(7 + idx, adapter_start, f"{adapter:<15}")
-                    path_start = adapter_start + 15
-                    if path_start < width - 1:
-                        stdscr.addstr(7 + idx, path_start, f"{path:<35}")
-                        rate_start = path_start + 35
-                        if rate_start < width - 1:
-                            stdscr.addstr(7 + idx, rate_start, f" {rate_str}")
+                # Write the line - we need to handle the colored name specially
+                # Split into: prefix (rank+pid), name (colored), suffix (adapter+path+rate+total)
+                prefix = f"{rank:<6} {pid:<8} "
+                suffix = f" {adapter:<12} {path:<28} {rate_str:<14} {total_str:<12}"
+                
+                # Write prefix
+                stdscr.addstr(7 + idx, 0, prefix)
+                # Write colored name
+                stdscr.addstr(7 + idx, len(prefix), f"{name:<20}", curses.color_pair(color) | curses.A_BOLD)
+                # Write suffix
+                stdscr.addstr(7 + idx, len(prefix) + 20, suffix[:width - len(prefix) - 20 - 1])
             
             # Draw footer
             if height > 20:
                 footer_line = height - 3
-                stdscr.addstr(footer_line, 0, "=" * min(width - 1, 120), curses.A_DIM)
+                stdscr.addstr(footer_line, 0, "=" * min(width - 1, 130), curses.A_DIM)
                 stdscr.addstr(footer_line + 1, 0, 
                             f"Color intensity indicates transfer rate (brighter = faster) | Showing {len(top_processes)} of {len(monitor.process_data)} active processes", 
                             curses.A_DIM)
