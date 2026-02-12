@@ -166,7 +166,7 @@ class TestNetworkMonitor(unittest.TestCase):
         self.assertEqual(top[1][1]['rate'], 400)  # proc4
         self.assertEqual(top[2][1]['rate'], 300)  # proc3
     
-    @patch('netmon.psutil.net_if_addrs')
+    @patch('netinspect.psutil.net_if_addrs')
     def test_update_interface_map(self, mock_net_if_addrs):
         """Test interface map update"""
         # Mock network interface addresses
